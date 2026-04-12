@@ -842,7 +842,12 @@ class EfinanceFetcher(BaseFetcher):
                 price_col = '最新价' if '最新价' in df.columns else 'price'
                 pct_col = '涨跌幅' if '涨跌幅' in df.columns else 'pct_chg'
                 chg_col = '涨跌额' if '涨跌额' in df.columns else 'change'
-                open_col = '开盘' if '开盘' in df.columns else 'open'
+                if '今开' in df.columns:
+                    open_col = '今开'
+                elif '开盘' in df.columns:
+                    open_col = '开盘'
+                else:
+                    open_col = 'open'
                 high_col = '最高' if '最高' in df.columns else 'high'
                 low_col = '最低' if '最低' in df.columns else 'low'
                 vol_col = '成交量' if '成交量' in df.columns else 'volume'
