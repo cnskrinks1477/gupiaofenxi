@@ -10,12 +10,24 @@ A股自选股智能分析系统 - AI分析层
 3. 解析 LLM 响应为结构化 AnalysisResult
 """
 
+import asyncio
 import json
 import logging
 import math
 import time
+import subprocess
+import os
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple, Callable
+
+# 引入专家委员会相关类
+from src.agents.experts.warren_buffett import WarrenBuffettExpert
+from src.agents.experts.li_lu import LiLuExpert
+from src.agents.experts.paul_tudor_jones import PaulTudorJonesExpert
+from src.agents.experts.jensen_huang import JensenHuangExpert
+from src.agents.experts.nassim_taleb import NassimTalebExpert
+from src.agents.consensus_engine import RayDalioAggregator
+from src.services.performance_tracker import PerformanceTracker
 
 import litellm
 from json_repair import repair_json
@@ -486,6 +498,65 @@ class AnalysisResult:
             "low": "⭐",
         }
         return star_map.get(str(self.confidence_level or "").strip().lower(), "⭐⭐")
+
+    def get_radar_data(self) -> List[Dict[str, Any]]:
+        """
+        获取雷达图数据
+        
+        维度：技术面、基本面、情绪面、资金流、风险度
+        """
+        # 默认值
+        tech_score = 50
+        fund_score = 50
+        sent_score = self.sentiment_score
+        flow_score = 50
+        risk_score = 50
+
+        if self.dashboard:
+            # 1. 技术面 (如果有 trend_score 则用，否则基于 sentiment_score 微调)
+            dp = self.dashboard.get("data_perspective", {})
+            tech_score = dp.get("trend_status", {}).get("trend_score", 
+                                                      min(100, max(0, int(self.sentiment_score * 0.9 + 5))))
+            
+            # 2. 资金流 (基于量比简单推算)
+            vol_ratio = dp.get("volume_analysis", {}).get("volume_ratio", 1.0)
+            try:
+                vr = float(vol_ratio) if vol_ratio and vol_ratio != "N/A" else 1.0
+                flow_score = min(100, max(0, int(50 + (vr - 1.0) * 20)))
+            except (ValueError, TypeError):
+                flow_score = 50
+
+            # 3. 风险度 (100 - 风险项数量*10)
+            risks = self.dashboard.get("intelligence", {}).get("risk_alerts", [])
+            # 保存分歧惩罚标志，待 risk_alerts 分算完后叠加，避免被覆盖
+            divergence_penalty = False
+            if self.dashboard.get("ensemble_reports"):
+                divergence = self.risk_warning or ""
+                if "分歧" in divergence or "争议" in divergence:
+                    divergence_penalty = True
+            risk_score = max(0, 100 - len(risks) * 10)
+            # 叠加委员会分歧惩罚：取两者最严格值
+            if divergence_penalty:
+                risk_score = min(risk_score, 40)
+
+            # 4. 基本面 (简单基于关键词或专家共识评分)
+            fund_analysis = (self.fundamental_analysis or "").lower()
+            if "增长" in fund_analysis or "优秀" in fund_analysis or "稳健" in fund_analysis:
+                fund_score = 75
+            elif "下滑" in fund_analysis or "亏损" in fund_analysis or "风险" in fund_analysis:
+                fund_score = 25
+            
+            # 如果是委员会模式，专家的一致性可以提升基本面信心
+            if self.dashboard.get("ensemble_reports"):
+                fund_score = max(fund_score, 60) # 委员会通常会关注基本面
+
+        return [
+            {"subject": "技术面", "value": tech_score, "fullMark": 100},
+            {"subject": "基本面", "value": fund_score, "fullMark": 100},
+            {"subject": "情绪面", "value": sent_score, "fullMark": 100},
+            {"subject": "资金流", "value": flow_score, "fullMark": 100},
+            {"subject": "风险度", "value": risk_score, "fullMark": 100},
+        ]
 
 
 class GeminiAnalyzer:
@@ -993,6 +1064,103 @@ class GeminiAnalyzer:
                 f"API key from environment)"
             )
 
+    async def _call_expert_async(self, expert_id: str, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
+        """
+        通过 LiteLLM API 异步调用专家节点。
+        输出契约：{"signal", "confidence", "reasoning"}
+        """
+        import litellm
+        import asyncio
+
+        config = self._get_runtime_config()
+        # ensemble/ 前缀之后的部分是真实模型名，或者使用主模型
+        model_name = config.litellm_model or "gemini/gemini-2.0-flash"
+        if model_name.startswith("ensemble/"):
+            model_name = model_name[len("ensemble/"):]
+            # 补全 provider 前缀（若不含 /）
+            if "/" not in model_name:
+                model_name = f"gemini/{model_name}"
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt + "\n\nOutput JSON ONLY. No markdown fences."},
+        ]
+
+        try:
+            loop = asyncio.get_event_loop()
+            response = await loop.run_in_executor(
+                None,
+                lambda: litellm.completion(model=model_name, messages=messages, temperature=0.3),
+            )
+            raw = response.choices[0].message.content.strip()
+            if "```json" in raw:
+                raw = raw.split("```json")[1].split("```")[0].strip()
+            elif "```" in raw:
+                raw = raw.split("```")[1].split("```")[0].strip()
+            return json.loads(raw)
+        except Exception as e:
+            logger.error(f"[Ensemble][LiteLLM] Failed for {expert_id}: {e}")
+            return {"signal": "neutral", "confidence": 0, "reasoning": f"LiteLLM Error: {str(e)[:80]}"}
+
+    async def _analyze_ensemble(self, context: Dict[str, Any], news_context: Optional[str] = None) -> Dict[str, Any]:
+        """
+        核心『大师委员会』并发执行逻辑。
+        """
+        code = context.get('code', 'Unknown')
+        name = context.get('stock_name', f"股票{code}")
+        
+        # 1. 准备技术指标与新闻上下文
+        technical_data = {
+            "current_price": context.get('today', {}).get('close', 'N/A'),
+            "trend_summary": context.get('ma_status', 'N/A'),
+            "technical_indicators": f"MACD/RSI: {context.get('trend_analysis', {}).get('trend_status', 'N/A')}"
+        }
+        # 提取新闻列表
+        news_list = []
+        if news_context:
+            # 简单切割新闻（此处可进一步优化为结构化解析）
+            news_list = [{"date": "", "title": line.strip()} for line in news_context.split("\n") if line.strip()][:5]
+
+        # 2. 初始化专家委员会
+        experts = [
+            WarrenBuffettExpert(),
+            LiLuExpert(),
+            PaulTudorJonesExpert(),
+            JensenHuangExpert(),
+            NassimTalebExpert()
+        ]
+        
+        # 3. 获取动态权重
+        tracker = PerformanceTracker()
+        weights = tracker.get_analyst_weights()
+        logger.info(f"[Ensemble] 启动并发分析 {name}({code})，当前权重: {weights}")
+        
+        # 4. 并发运行专家节点
+        tasks = []
+        for e in experts:
+            user_prompt = e.prepare_prompt(name, technical_data, news_list)
+            tasks.append(self._call_expert_async(e.get_expert_id(), e.SYSTEM_PROMPT, user_prompt))
+        
+        try:
+            expert_results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=120)
+        except asyncio.TimeoutError:
+            logger.error(f"[Ensemble] 专家委员会分析超时（120s），{name}({code})")
+            raise RuntimeError(f"Ensemble analysis timed out for {code}")
+        expert_reports = {experts[i].get_expert_id(): expert_results[i] for i in range(len(experts))}
+        
+        # 5. 记录战绩埋点 (供阶段四结算)
+        for eid, rep in expert_reports.items():
+            tracker.record_prediction(eid, code, rep.get('signal'), rep.get('confidence', 50))
+
+        # 6. 达里奥共识聚合
+        aggregator = RayDalioAggregator()
+        consensus_prompt = aggregator.prepare_consensus_prompt(name, expert_reports, weights)
+        final_consensus = await self._call_expert_async(aggregator.get_expert_id(), aggregator.SYSTEM_PROMPT, consensus_prompt)
+        
+        # 7. 注入专家报告详情到 metadata，以便 WebUI 渲染
+        final_consensus["expert_reports"] = expert_reports
+        return final_consensus
+
     def is_available(self) -> bool:
         """Check if LiteLLM is properly configured with at least one API key."""
         return self._router is not None or self._litellm_available
@@ -1160,6 +1328,7 @@ class GeminiAnalyzer:
         effective_system_prompt = system_prompt or self.TEXT_SYSTEM_PROMPT
         router_model_names = set(get_configured_llm_models(config.llm_model_list))
         for model in models_to_try:
+            # --- LiteLLM 路径 ---
             try:
                 model_short = model.split("/")[-1] if "/" in model else model
                 call_kwargs: Dict[str, Any] = {
@@ -1266,11 +1435,12 @@ class GeminiAnalyzer:
             return None
 
     def analyze(
-        self, 
+        self,
         context: Dict[str, Any],
         news_context: Optional[str] = None,
         progress_callback: Optional[Callable[[int, str], None]] = None,
         stream_progress_callback: Optional[Callable[[int], None]] = None,
+        analysis_mode: Optional[str] = None,
     ) -> AnalysisResult:
         """
         分析单只股票
@@ -1318,6 +1488,11 @@ class GeminiAnalyzer:
                 # 最后从映射表获取
                 name = STOCK_NAME_MAP.get(code, f'股票{code}')
         
+        config = self._get_runtime_config()
+        model_name = config.litellm_model or "unknown"
+        report_language = normalize_report_language(getattr(config, "report_language", "zh"))
+        system_prompt = self._get_analysis_system_prompt(report_language, stock_code=code)
+        
         # 如果模型不可用，返回默认结果
         if not self.is_available():
             return AnalysisResult(
@@ -1336,6 +1511,22 @@ class GeminiAnalyzer:
             )
         
         try:
+            # ========== Ensemble 专家模式路由 ==========
+            if model_name.startswith("ensemble/") or analysis_mode == "ensemble":
+                logger.info(f"[Ensemble] 检测到专家委员会路由: {model_name}")
+                # 调用异步 Ensemble 逻辑
+                try:
+                    ensemble_data = asyncio.run(self._analyze_ensemble(context, news_context))
+                    # 将达里奥的 JSON 映射回 AnalysisResult
+                    result = self._map_ensemble_to_result(ensemble_data, code, name, report_language)
+                    result.search_performed = bool(news_context)
+                    result.model_used = model_name
+                    result.market_snapshot = self._build_market_snapshot(context)
+                    return result
+                except Exception as e:
+                    logger.error(f"[Ensemble] 专家分析链条故障: {e}")
+                    # 故障回退到普通 LLM 或抛出错误
+
             # 格式化输入（包含技术面数据和新闻）
             prompt = self._format_prompt(context, name, news_context, report_language=report_language)
             
@@ -1934,6 +2125,51 @@ class GeminiAnalyzer:
     def _apply_placeholder_fill(self, result: AnalysisResult, missing_fields: List[str]) -> None:
         """Delegate to module-level apply_placeholder_fill."""
         apply_placeholder_fill(result, missing_fields)
+
+    def _map_ensemble_to_result(self, data: Dict[str, Any], code: str, name: str, report_language: str) -> AnalysisResult:
+        """
+        将专家委员会的聚合 JSON 转换为 AnalysisResult 结构。
+        """
+        rating_map = {
+            "Strong Buy": {"score": 90, "advice": "买入", "type": "buy"},
+            "Buy": {"score": 75, "advice": "加仓", "type": "buy"},
+            "Hold": {"score": 50, "advice": "观望", "type": "hold"},
+            "Sell": {"score": 25, "advice": "减仓", "type": "sell"},
+            "Strong Sell": {"score": 10, "advice": "卖出", "type": "sell"}
+        }
+        
+        rating = data.get("final_rating", "Hold")
+        mapped = rating_map.get(rating, rating_map["Hold"])
+        
+        # 构造仪表盘结构（适配 WebUI）
+        dashboard = {
+            "core_conclusion": {
+                "one_sentence": data.get("action_plan", "委员会建议观望"),
+                "signal_type": "🟢买入" if "Buy" in rating else "🔴卖出" if "Sell" in rating else "🟡观望",
+                "time_sensitivity": "今日内"
+            },
+            "intelligence": {
+                "sentiment_summary": data.get("consensus_summary", ""),
+                "risk_alerts": [data.get("divergence_analysis", "专家意见存在分歧")]
+            },
+            # 专家报告透传（用于前端扩展展示）
+            "ensemble_reports": data.get("expert_reports", {})
+        }
+        
+        return AnalysisResult(
+            code=code,
+            name=name,
+            sentiment_score=mapped["score"],
+            trend_prediction=rating,
+            operation_advice=mapped["advice"],
+            decision_type=mapped["type"],
+            confidence_level="高",
+            report_language=report_language,
+            dashboard=dashboard,
+            analysis_summary=data.get("consensus_summary", ""),
+            risk_warning=data.get("divergence_analysis", ""),
+            success=True
+        )
 
     def _parse_response(
         self, 

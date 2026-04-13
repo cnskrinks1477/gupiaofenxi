@@ -262,6 +262,7 @@ def _handle_async_analysis_batch(
         report_type=request.report_type,
         force_refresh=request.force_refresh,
         notify=notify,
+        analysis_mode=getattr(request, "analysis_mode", None),
     )
 
     accepted_tasks, duplicate_errors = task_queue.submit_tasks_batch(**submit_kwargs)
@@ -344,6 +345,7 @@ def _handle_sync_analysis(
             force_refresh=request.force_refresh,
             query_id=query_id,
             send_notification=getattr(request, "notify", True),
+            analysis_mode=getattr(request, "analysis_mode", None),
         )
 
         if result is None:
@@ -808,6 +810,8 @@ def _build_analysis_report(
             dividend_metrics=extracted_fundamental.get("dividend_metrics"),
             belong_boards=extracted_boards.get("belong_boards"),
             sector_rankings=extracted_boards.get("sector_rankings"),
+            ensemble_reports=details_data.get("ensemble_reports"),
+            radar_data=details_data.get("radar_data"),
         )
 
     return AnalysisReport(
