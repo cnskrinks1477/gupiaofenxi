@@ -1,0 +1,13 @@
+model_list:
+  - model_name: my-smart-model
+    litellm_params:
+      model: openai/deepseek-chat
+      api_base: https://api.deepseek.com/v1
+      api_key: "os.environ/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"  # 从环境变量读取 Key，安全防泄漏
+
+  # Ollama 本地模型（无需 api_key）
+  - model_name: ollama/qwen3:8b
+    litellm_params:
+      model: ollama/qwen3:8b
+      api_base: http://localhost:11434
+      LITELLM_CONFIG=./litellm_config.yaml
